@@ -3,14 +3,14 @@ import os
 from icalendar import Calendar
 import datetime
 
-def import_calendar(calendar_source):
-    if calendar_source.startswith('http'):
-        response = requests.get(calendar_source)
+def import_calendar(calendar):
+    if calendar.startswith('http'):
+        response = requests.get(calendar)
         response.raise_for_status()
         calendar_data = response.text
     else:
         try:
-            with open(calendar_source, 'rb') as f:
+            with open(calendar, 'rb') as f:
                 calendar_data = f.read()
         except FileNotFoundError:
             raise FileNotFoundError("Invalid file path to the iCal file.")
@@ -18,32 +18,34 @@ def import_calendar(calendar_source):
     calendar = Calendar.from_ical(calendar_data)
     return calendar
 
-def get_user(user_id):
+def get_user(user_id, api_key):
     api_url = f"https://api.pagerduty.com/users/{user_id}"
     headers = {
+        "Content-Type": "application/json",
         "Accept": "application/vnd.pagerduty+json;version=2",
-        "Authorization": "API TOKEN"  # Replace with your PagerDuty API key
+        "Authorization": api_key 
     }
 
     response = requests.get(api_url, headers=headers)
     response.raise_for_status()
-    user_data = response.json()
+    user = response.json()
 
-    return user_data
+    return user
 
-def create_schedule_layers(calendar):
+def create_schedule_layers(calendar, api_key):
     schedule_layers = {}
+    i = 1
 
     for component in calendar.walk():
         if component.name == 'VEVENT':
-            event_name = component.get('SUMMARY', '')
+            pd_user_id = component.get('SUMMARY', '')
             event_date = component.get('DTSTART').dt.date()
             event_start_time = component.get('DTSTART').dt.time()
             event_end_time = component.get('DTEND').dt.time()
             weekday_number = event_date.isoweekday()
 
             try:
-                user_data = get_user(event_name)
+                user = get_user(pd_user_id, api_key)
 
                 start = datetime.combine(event_date, event_start_time).strftime("%Y-%m-%dT%H:%M")
                 rotation_virtual_start = start
@@ -54,20 +56,21 @@ def create_schedule_layers(calendar):
 
                 users = [
                     {
-                        'user_id': event_name,
+                        'user_id': pd_user_id,
                         'type': 'user_reference'
                     }
                 ]
 
-                schedule_layer = {
+                layer = {
                     'start': start,
                     'rotation_virtual_start': rotation_virtual_start,
                     'rotation_turn_length_seconds': rotation_turn_length_seconds,
                     'users': users
                 }
 
-                schedule_layers[layer_1] = schedule_layer
+                layer_name = f'layer_{i}'
+                schedule_layers[layer_name] = layer
             except requests.exceptions.RequestException:
-                raise(f"Error getting user from PagerDuty'{event_name}'")
+                raise RequestException(f"Error getting user from PagerDuty'{pd_user_id}'")
 
     return schedule_layers
