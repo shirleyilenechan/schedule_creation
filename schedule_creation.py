@@ -53,8 +53,6 @@ def create_schedule_df(calendar, api_key):
         if component.name == 'VEVENT':
             if pd_user_id:
                 user = get_user(pd_user_id, api_key)
-            else:
-                raise("User ID could not be extracted from event summary")
             
             start_dt = component.get('dtstart').dt
             end_dt = component.get('dtend').dt
