@@ -2,8 +2,8 @@ import requests
 import os
 from icalendar import Calendar
 from datetime import datetime as dt, timedelta, timezone
-import pytz
-from dateutil.rrule import rrulestr
+from dateutil.rrule import rrule as rr, rrulestr
+from dateutil import tz
 import pandas as pd
 import argparse
 import sys
@@ -27,6 +27,7 @@ def import_calendar(calendar):
     calendar = Calendar.from_ical(calendar_data)
     return calendar
 
+
 def get_user(pd_user_id, api_key):
     api_url = f"https://api.pagerduty.com/users/{pd_user_id}"
     headers = {
@@ -43,6 +44,7 @@ def get_user(pd_user_id, api_key):
 
     return user
 
+
 def create_schedule_df(calendar, api_key):
     df = pd.DataFrame(columns = ["name", "start" "end"])
     shifts = []
@@ -56,7 +58,8 @@ def create_schedule_df(calendar, api_key):
             
             start_dt = component.get('dtstart').dt
             end_dt = component.get('dtend').dt
-            
+    
+
             if component.get("rrule"):
                 rrule = component.get("rrule")
                 instances = extract_recurring_events(pd_user_id, rrule, start_dt, end_dt)
@@ -66,37 +69,43 @@ def create_schedule_df(calendar, api_key):
                 shift = {
                     "name": pd_user_id,
                     "start": start_dt,
-                    "end": end_dt,
-                    "recurring": False
+                    "end": end_dt
                 }
 
                 shifts.append(shift)
 
     df = pd.DataFrame(shifts)
+    
     return df
 
                 
 def extract_recurring_events(name, rrule, start, end):
-
     instances = []
-    rrule_str = rrule.to_ical().decode("utf-8")
-    rule = rrulestr(rrule_str)
+    rrule_str = rrule.to_ical().decode('utf-8')
+    dateutil_rrule = rrulestr(rrule_str, dtstart=start)
+    shift_duration = end - start
     
-    shift_length = end - start
-
-    shifts = list(rule)
-
-    for shift_start in shifts:
+    for event_start in dateutil_rrule:
         shift = {
-            "name": name,
-            "start":shift_start,
-            "end": shift_start + shift_length,
-            "recurring": True
-        }
-
+                    "name": name,
+                    "start": event_start,
+                    "end": event_start + shift_duration
+                }
         instances.append(shift)
 
-    return instances
+    return(instances)
+
+
+def create_schedule_layers(df):
+    
+    df["start"] = (pd.to_datetime(df['start'], utc=True)).dt.tz_convert('UTC')
+    df["end"] = (pd.to_datetime(df['end'], utc=True)).dt.tz_convert('UTC')
+    
+    df["dow"] = df["start"].dt.day_name()
+    df["start_time"] = df["start"].dt.time
+    df["duration"] = (df["end"] - df["start"]).dt.total_seconds()
+
+    
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
@@ -104,7 +113,8 @@ def main(argv=None):
     parser.add_argument("--api_key", "-a", dest="api_key", required=True)
     args = parser.parse_args()
     calendar = import_calendar(args.calendar)
-    create_schedule_df(calendar, args.api_key)
+    df = create_schedule_df(calendar, args.api_key)
+
 
 if __name__ == '__main__':
     sys.exit(main())
