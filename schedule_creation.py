@@ -25,6 +25,7 @@ def import_calendar(calendar):
             raise FileNotFoundError("Invalid file path to the iCal file.")
 
     calendar = Calendar.from_ical(calendar_data)
+
     return calendar
 
 
@@ -46,35 +47,37 @@ def get_user(pd_user_id, api_key):
 
 
 def create_schedule_df(calendar, api_key):
-    df = pd.DataFrame(columns = ["name", "start" "end"])
     shifts = []
     
     for component in calendar.walk():
         pd_user_id = component.get('summary')
 
+        #TODO: error handling if we cannot extract the vevent component
         if component.name == 'VEVENT':
             if pd_user_id:
                 user = get_user(pd_user_id, api_key)
             
             start_dt = component.get('dtstart').dt
-            end_dt = component.get('dtend').dt
-    
-
+            end_dt = component.get("dtend").dt
+        
             if component.get("rrule"):
                 rrule = component.get("rrule")
                 instances = extract_recurring_events(pd_user_id, rrule, start_dt, end_dt)
                 shifts.extend(instances)
-
+            #TODO: determine how to handle events that do not recurr
             else:                 
                 shift = {
-                    "name": pd_user_id,
+                    "user_id": pd_user_id,
                     "start": start_dt,
-                    "end": end_dt
+                    "end": end_dt,
+                    "recurrence_end": True
                 }
-
                 shifts.append(shift)
 
+                
     df = pd.DataFrame(shifts)
+
+    df = df.drop_duplicates().sort_values("start")
     
     return df
 
@@ -83,30 +86,51 @@ def extract_recurring_events(name, rrule, start, end):
     instances = []
     rrule_str = rrule.to_ical().decode('utf-8')
     dateutil_rrule = rrulestr(rrule_str, dtstart=start)
+    until = rrule.get("until", [None])[0]
     shift_duration = end - start
+    max_timeframe = start + timedelta(days=365)
     
     for event_start in dateutil_rrule:
-        shift = {
-                    "name": name,
-                    "start": event_start,
-                    "end": event_start + shift_duration
-                }
-        instances.append(shift)
+        if event_start > max_timeframe:
+            break
+        else: 
+            shift = {
+                "user_id": name,
+                "start": event_start,
+                "end": event_start + shift_duration,
+                "recurrence_end": until is not None,
+            }
+            instances.append(shift)
 
     return(instances)
 
 
-def create_schedule_layers(df):
+def add_columns_for_creating_layers(df):
     
     df["start"] = (pd.to_datetime(df['start'], utc=True)).dt.tz_convert('UTC')
     df["end"] = (pd.to_datetime(df['end'], utc=True)).dt.tz_convert('UTC')
     
-    df["dow"] = df["start"].dt.day_name()
+    df["dow"] = df["start"].dt.dayofweek
     df["start_time"] = df["start"].dt.time
     df["duration"] = (df["end"] - df["start"]).dt.total_seconds()
+    df["week"] = df["start"].dt.isocalendar().week
 
+    return df
+
+
+def create_schedule_layers(df):
+
+    schedule_restrictions_df = df.groupby(['start_time', 'duration', "user_id", "recurrence_end"]).agg({
+        "dow": set, "week": "first", "start": "first", "end": "last"}).reset_index().sort_values("week")
+
+    schedule_restrictions_df = schedule_restrictions_df.groupby(['start_time', 'duration', "recurrence_end"]).agg({
+        "dow": list, "user_id": list, "week": list, "start": "min", "end": "max"}).reset_index()
     
+    #To do: single user spanning multiple weeks is a weekly rotation
+    weekly_rotations_df = schedule_restrictions_df[schedule_restrictions_df['week'].apply(lambda x: len(set(x)) > 1)]
 
+    daily_rotations_df = schedule_restrictions_df[schedule_restrictions_df['week'].apply(lambda x: len(set(x)) == 1)]
+    
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--calendar", "-c", dest="calendar", required=True)
@@ -114,6 +138,8 @@ def main(argv=None):
     args = parser.parse_args()
     calendar = import_calendar(args.calendar)
     df = create_schedule_df(calendar, args.api_key)
+    df = add_columns_for_creating_layers(df)
+    schedule_layers = create_schedule_layers(df)
 
 
 if __name__ == '__main__':
