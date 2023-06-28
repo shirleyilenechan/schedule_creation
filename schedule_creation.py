@@ -118,18 +118,25 @@ def add_columns_for_creating_layers(df):
     return df
 
 
-def create_schedule_layers(df):
+def create_weekly_layers(df):
 
     schedule_restrictions_df = df.groupby(['start_time', 'duration', "user_id", "recurrence_end"]).agg({
-        "dow": set, "week": "first", "start": "first", "end": "last"}).reset_index().sort_values("week")
-
-    schedule_restrictions_df = schedule_restrictions_df.groupby(['start_time', 'duration', "recurrence_end"]).agg({
-        "dow": list, "user_id": list, "week": list, "start": "min", "end": "max"}).reset_index()
+        "dow": lambda x: str(set(x)), "week": "first", "start": "first", "end": "last"}).reset_index().sort_values("week")
     
-    #To do: single user spanning multiple weeks is a weekly rotation
-    weekly_rotations_df = schedule_restrictions_df[schedule_restrictions_df['week'].apply(lambda x: len(set(x)) > 1)]
 
-    daily_rotations_df = schedule_restrictions_df[schedule_restrictions_df['week'].apply(lambda x: len(set(x)) == 1)]
+    schedule_restrictions_df = schedule_restrictions_df.groupby(['start_time', 'duration', "recurrence_end", "dow"]).agg({
+        "user_id": list, "week": list, "start": "min", "end": "max"}).reset_index()
+    
+    week_span = (schedule_restrictions_df["end"] - schedule_restrictions_df["start"]).dt.days/7
+
+    weekly_rotation_group = schedule_restrictions_df[schedule_restrictions_df['week'].apply(lambda x: len(set(x)) > 1)]
+
+    weekly_rotation_individual = schedule_restrictions_df[(schedule_restrictions_df['week'].apply(lambda x: len(set(x)) == 1)) & 
+    (week_span > 1)]
+
+    weekly_rotation = pd.concat([weekly_rotation_group, weekly_rotation_individual], ignore_index=True)
+
+   
     
 def main(argv=None):
     parser = argparse.ArgumentParser()
@@ -139,7 +146,7 @@ def main(argv=None):
     calendar = import_calendar(args.calendar)
     df = create_schedule_df(calendar, args.api_key)
     df = add_columns_for_creating_layers(df)
-    schedule_layers = create_schedule_layers(df)
+    schedule_layers = create_weekly_layers(df)
 
 
 if __name__ == '__main__':
