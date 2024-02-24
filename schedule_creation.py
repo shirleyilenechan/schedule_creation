@@ -1,13 +1,10 @@
 import requests
-import os
+import pandas as pd
 from icalendar import Calendar
 from datetime import datetime as dt, timedelta, timezone
-from dateutil.rrule import rrule as rr, rrulestr
-from dateutil import tz
-import pandas as pd
-import argparse
-import sys
-
+from dateutil.rrule import rrule, rrulestr
+import numpy as np
+import pytz
 
 def import_calendar(calendar):
     if calendar.startswith('http'):
@@ -15,140 +12,185 @@ def import_calendar(calendar):
             response = requests.get(calendar)
             calendar_data = response.text
         except requests.exceptions.RequestException:
-            raise SystemExit("Cannot import calendar from invalid URL")
-            
+            raise ValueError("Cannot import calendar from invalid URL")
     else:
         try:
             with open(calendar, 'rb') as f:
                 calendar_data = f.read()
         except FileNotFoundError:
             raise FileNotFoundError("Invalid file path to the iCal file.")
+        
+    cal = Calendar.from_ical(calendar_data)
 
-    calendar = Calendar.from_ical(calendar_data)
-
-    return calendar
+    return cal
 
 
-def get_user(pd_user_id, api_key):
-    api_url = f"https://api.pagerduty.com/users/{pd_user_id}"
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/vnd.pagerduty+json;version=2",
-        "Authorization": f"Token token={api_key}"
+def create_event_object(start_dt, end_dt, user_data, recurring):
+    duration = (end_dt - start_dt).total_seconds()
+    day_of_week_start = start_dt.isoweekday()
+    day_of_week_end = end_dt.isoweekday()
+    week_number = start_dt.isocalendar()[1]
+
+    # create an event object
+    event_data = {
+        'user': user_data,
+        'start_dt': start_dt.astimezone(pytz.utc),
+        'end_dt': end_dt.astimezone(pytz.utc),
+        'start_time': start_dt.time(),
+        'end_time': end_dt.time(),
+        'duration': duration,
+        'dow_start': day_of_week_start,
+        'dow_end': day_of_week_end,
+        'week': week_number,
+        'recurring': recurring
     }
 
-    try: 
-        response = requests.get(api_url, headers=headers)
-        user = response.json()
-    except requests.exceptions.RequestException:
-        raise SystemExit(f"Error getting user from PagerDuty'{pd_user_id}'")
-
-    return user
+    return event_data
 
 
-def create_schedule_df(calendar, api_key):
-    shifts = []
+def extract_recurring_events(start_dt, end_dt, user_data, recurring, rrule):
+    current_dt = dt.now(start_dt.tzinfo)
+    # when creating the dataframe, limit the data to Now+365 days
+    max_timeframe_to_check = current_dt + timedelta(days=365)
+    duration = (end_dt - start_dt)
+    until = rrule.get('until')
+
+
+    # set a default until date if None is provided
+    if until is None:
+        until = max_timeframe_to_check
+    else:
+        # extract until from the rrule
+        until = until[0].astimezone(start_dt.tzinfo)
+        # limit until to the max timeframe
+        if until > max_timeframe_to_check:
+            until = max_timeframe_to_check
+
+    # Create an rrule string from the vrecur
+    rrule_string = rrule.to_ical().decode('utf-8')
+    recurring_events = []
+
+    # Use the recurrence information in the rrulestr to create a list of start_dt
+    rule = rrulestr(rrule_string, dtstart=start_dt)
+    start_dt_list = rule.between(current_dt, until, inc=True)
     
-    for component in calendar.walk():
-        pd_user_id = component.get('summary')
+    # add recurring events to the recurring events list
+    for start in start_dt_list:
+        event_end = start + duration
+        event = create_event_object(start, event_end, user_data, recurring)
+        recurring_events.append(event)
 
-        #TODO: error handling if we cannot extract the vevent component
-        if component.name == 'VEVENT':
-            if pd_user_id:
-                user = get_user(pd_user_id, api_key)
-            
-            start_dt = component.get('dtstart').dt
-            end_dt = component.get("dtend").dt
+    return recurring_events
+
+
+def create_calendar_df(calendar):
+    # Prepare a list to hold event data
+    events_data = []
+
+    for event in calendar.walk('vevent'):
+        # extract event start and end
+        start_dt = event.get('dtstart').dt
+        end_dt = event.get('dtend').dt
+
+        # extract pd_user_id from the event summary
+        user_id = str(event.get('summary'))
         
-            if component.get("rrule"):
-                rrule = component.get("rrule")
-                instances = extract_recurring_events(pd_user_id, rrule, start_dt, end_dt)
-                shifts.extend(instances)
-            #TODO: determine how to handle events that do not recurr
-            else:                 
-                shift = {
-                    "user_id": pd_user_id,
-                    "start": start_dt,
-                    "end": end_dt,
-                    "recurrence_end": True
-                }
-                shifts.append(shift)
+        recurring = 'rrule' in event
 
-                
-    df = pd.DataFrame(shifts)
+        if recurring:
+            # add recurring events to the dataframe
+            rrule = event.get('rrule')
+            recurring_events = extract_recurring_events(start_dt, end_dt, user_id, recurring, rrule)
+            events_data.extend(recurring_events)
+        else:
+            # otherwise, just append non-recurring the event
+            event_object = create_event_object(start_dt, end_dt, user_id, recurring)
+            events_data.append(event_object)
 
-    df = df.drop_duplicates().sort_values("start")
+    df = pd.DataFrame(events_data)
+
+    df = df.sort_values(by=['start_dt'])
     
     return df
 
-                
-def extract_recurring_events(name, rrule, start, end):
-    instances = []
-    rrule_str = rrule.to_ical().decode('utf-8')
-    dateutil_rrule = rrulestr(rrule_str, dtstart=start)
-    until = rrule.get("until", [None])[0]
-    shift_duration = end - start
-    max_timeframe = start + timedelta(days=365)
+
+def calculate_shift_pattern(user_list):
+    for i in range(1, len(user_list) // 2 + 1):
+        subset = user_list[:i]
+        repeat_count = (len(user_list) // i)
+        remainder = user_list[:len(user_list) % i]
+        if subset * repeat_count + remainder == user_list:
+            return subset
+    return user_list
+
+
+def get_rotation_pattern(row):
+    if row['shift_handover_frequency'] == 'weekly_restriction':
+        # Create a DataFrame from the week and user lists
+        df = pd.DataFrame({
+            'week': row['week'],
+            'user': row['user']
+        })
+
+        # Drop duplicate 'week' entries to ensure one user per week
+        df = df.drop_duplicates(subset='week')
+
+        # Sort the DataFrame based on 'week' to maintain chronological order
+        df = df.sort_values(by='week')
+
+        # The rotation pattern is the sequence of users by week
+        user_list = df['user'].tolist()
+
+        rotation_pattern = calculate_shift_pattern(user_list)
+
+        return rotation_pattern
     
-    for event_start in dateutil_rrule:
-        if event_start > max_timeframe:
-            break
-        else: 
-            shift = {
-                "user_id": name,
-                "start": event_start,
-                "end": event_start + shift_duration,
-                "recurrence_end": until is not None,
-            }
-            instances.append(shift)
-
-    return(instances)
-
-
-def add_columns_for_creating_layers(df):
-    
-    df["start"] = (pd.to_datetime(df['start'], utc=True)).dt.tz_convert('UTC')
-    df["end"] = (pd.to_datetime(df['end'], utc=True)).dt.tz_convert('UTC')
-    
-    df["dow"] = df["start"].dt.dayofweek
-    df["start_time"] = df["start"].dt.time
-    df["duration"] = (df["end"] - df["start"]).dt.total_seconds()
-    df["week"] = df["start"].dt.isocalendar().week
-
-    return df
-
-
-def create_weekly_layers(df):
-
-    schedule_restrictions_df = df.groupby(['start_time', 'duration', "user_id", "recurrence_end"]).agg({
-        "dow": lambda x: str(set(x)), "week": "first", "start": "first", "end": "last"}).reset_index().sort_values("week")
+    elif row['shift_handover_frequency'] == 'daily_restriction':
+        user_list = row['user']
+        rotation_pattern = calculate_shift_pattern(user_list)
+        
+        return rotation_pattern
     
 
-    schedule_restrictions_df = schedule_restrictions_df.groupby(['start_time', 'duration', "recurrence_end", "dow"]).agg({
-        "user_id": list, "week": list, "start": "min", "end": "max"}).reset_index()
+def calculate_handover_frequency(row):
+    # Create a DataFrame from the week and user lists
+    week_user_df = pd.DataFrame({
+        'week': row['week'],
+        'user': row['user']
+    })
+
+    # Group by week and check if all entries for each week have the same user
+    single_user_week = week_user_df.groupby('week')['user'].nunique() == 1
+
+    # Check if all weeks have a single user
+    weekly = single_user_week.all()
+
+    if weekly:
+        return "weekly_restriction"
+    else:
+        return "daily_restriction"
     
-    week_span = (schedule_restrictions_df["end"] - schedule_restrictions_df["start"]).dt.days/7
 
-    weekly_rotation_group = schedule_restrictions_df[schedule_restrictions_df['week'].apply(lambda x: len(set(x)) > 1)]
+def create_schedule_layers(df):
+    # Sort the dataframe by 'start_dt' to ensure the order of rotation is correct.
+    df = df.sort_values(by=['start_dt'])
 
-    weekly_rotation_individual = schedule_restrictions_df[(schedule_restrictions_df['week'].apply(lambda x: len(set(x)) == 1)) & 
-    (week_span > 1)]
+    # Group by 'start_time', 'duration' 
+    user_combinations = df.groupby(['start_time', 'duration']).agg({
+        'dow_start': 'unique',
+        'user': list,
+        'week': list,
+        'start_dt': 'min'
+    }).reset_index()
 
-    weekly_rotation = pd.concat([weekly_rotation_group, weekly_rotation_individual], ignore_index=True)
-
-   
+    user_combinations['shift_handover_frequency'] = user_combinations.apply(
+        lambda row: calculate_handover_frequency(row), axis=1)
     
-def main(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--calendar", "-c", dest="calendar", required=True)
-    parser.add_argument("--api_key", "-a", dest="api_key", required=True)
-    args = parser.parse_args()
-    calendar = import_calendar(args.calendar)
-    df = create_schedule_df(calendar, args.api_key)
-    df = add_columns_for_creating_layers(df)
-    schedule_layers = create_weekly_layers(df)
+    user_combinations['shift_pattern'] = user_combinations.apply(
+        lambda row: get_rotation_pattern(row), axis=1)
+    
+    user_combinations = user_combinations.drop(columns=['user', 'week'])
 
+    return user_combinations
 
-if __name__ == '__main__':
-    sys.exit(main())
 
